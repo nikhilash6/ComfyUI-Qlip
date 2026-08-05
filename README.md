@@ -37,6 +37,25 @@ on RTX 5090). More side-by-side comparisons and metrics in the
 
 ## Updates
 
+**2026-08-04** — Four new acceleration nodes: sparse attention, caching, progressive resolution, managed compiler
+- **QlipAutoSparse** — one-knob int8 dynamic block-sparse attention on any DiT.
+  Blocks are picked per step by a **diversity selector** (similarity minus
+  redundancy); at 70% sparsity it holds dense-level quality (DOVER-checked).
+- **QlipCache** — step caching (EasyCache / TaylorSeer / HiCache predictors,
+  separate cache per CFG branch) plus a DBCache-style `block` mode that also
+  helps few-step distilled models.
+- **QlipProgressive** — early denoising steps on a downscaled latent with a
+  no-knobs `auto` ladder; handles nested multimodal latents (MiniMax H3
+  video+audio: video is downscaled, audio passes through).
+- **QlipCompile** (+ **QlipQuantConfig**) — per-block `torch.compile` with
+  optional **FP8/NVFP4** scaled GEMM: no ONNX export, cold start in seconds,
+  resolution changes without recompile, `weights_policy=release` for a big
+  VRAM cut.
+- The four axes stack multiplicatively and need no precompiled engines, so
+  they run on models released days ago: **5.58× on Krea-2 Turbo, 5.09× on
+  Z-Image-Turbo, 4.02× on the video+audio MiniMax H3** (all RTX 5090, vs
+  eager), **2.27× on non-distilled Wan 2.2** (H100).
+
 **2026-07-02** — Blackwell (RTX 5090 / B200) engines + Wan 2.2 low→high LoRA
 - **Blackwell engine rollout** — recompiled the lineup for Blackwell with **NVFP4
   (FP4)** weights (~4× smaller than BF16, native Blackwell fast path) plus **FP4
@@ -62,7 +81,7 @@ on RTX 5090). More side-by-side comparisons and metrics in the
 - **Wan 2.2 I2V (14B)** — image-to-video, FP8 + LoRA, two-stage pipeline (high-noise + low-noise), dynamic shapes up to 640x640
 - **Shared memory** — new `shared_memory` parameter in QlipEnginesLoader. Multiple loaders with the same group name share one GPU memory pool (size = max, not sum). Enables Wan 2.2 two-transformer setup without doubling VRAM
 - **Custom model patches** (`qlip_patch.py`) — place `qlip_patch.py` next to engine files, auto-loaded at runtime. Supports `patch_signatures(dm)` and `patch_caller(dm)` hooks
-- **LTX-Video 2.3 (22B)** — text-to-video, FP8 + LoRA, dynamic shapes (512px–1408px, 9–121 frames)
+- **LTX-Video 2.3 (22B)** — text-to-video, FP8; distilled (+ LoRA, dynamic shapes 512px–1408px, 9–121 frames) and dev (FP8-static, no LoRA, 1280×704×121)
 - **Qwen Image Edit** — image editing, BF16 + LoRA, dynamic shapes (512px–1536px), reference image support
 
 ## Table of Contents
@@ -142,13 +161,14 @@ Image generation model. Compiled with cfg=1.0, batch=1, static sizes only.
 
 #### LTX-Video 2.3 (22B)
 
-Text-to-video model. 22B full-scale (non-distilled) LTXAV architecture with audio+video dual-stream attention. Compiled as t2v (text-to-video) with fixed batch=2.
+Text-to-video model. 22B full-scale LTXAV architecture with audio+video dual-stream attention. Compiled as t2v (text-to-video). Two builds: the LoRA-enabled **distilled** engines (dynamic shapes, batch 2), and the standalone **dev** engines (FP8-static, batch 1, fixed size — no LoRA needed).
 
-| Variant | CFG      | Batch | Engine Type | Static Sizes (WxHxFrames) | Dynamic Range |
-|---------|----------|-------|-------------|--------------------------|---------------|
+| Variant | CFG | Batch | Engine Type | Static Sizes (WxHxFrames) | Dynamic Range |
+|---------|-----|-------|-------------|--------------------------|---------------|
 | 22B distilled FP8 + LoRA | 1.0, 4.0 | 2 (fixed) | t2v | 768x512x41, 1280x720x121, 1408x896x121 | 512px—768px—1408px, 9—121 frames |
+| 22B **dev** FP8-static (no LoRA) | 1.0 | 1 (fixed) | t2v | 1280x704x121 | fixed (static build) |
 
-Video resolution and frame count are both dynamic. LoRA rank 1–256.
+The **distilled** engines have dynamic resolution and frame count (LoRA rank 1–256). The **dev** engines are FP8-**static**: compiled to a single size (1280×704×121, 15-step schedule) for maximum quality at that resolution, batch 1 (cfg 1.0), and carry no LoRA runtime overhead. Use the dev engines when you want the full dev checkpoint at a fixed size; use the distilled engines for dynamic sizes and runtime LoRA.
 
 #### Qwen Image Edit
 
@@ -189,11 +209,12 @@ All measurements: single image/video generation, batch size 1, H100, torch 2.8.0
 | | torch.compile ([KJNodes](https://github.com/kijai/ComfyUI-KJNodes)) | 3.064 | 1.22x |
 | | **Qlip BF16 + LoRA** | 2.944 | 1.27x |
 | | **Qlip FP8 + LoRA** | 2.215 | **1.69x** |
-| **Z-Image-Turbo** | Eager (PyTorch) | 1.436 | 1.0x |
-| | torch.compile ([KJNodes](https://github.com/kijai/ComfyUI-KJNodes)) | 0.999 | 1.44x |
-| | [SGLDiffusion](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion) | 0.920 | 1.56x |
-| | **Qlip BF16 + LoRA** | 0.957 | 1.50x |
-| | **Qlip FP8 + LoRA** | 0.773 | **1.86x** |
+| **Z-Image-Turbo** | Eager (PyTorch) | 1.142 | 1.0x |
+| | torch.compile ([KJNodes](https://github.com/kijai/ComfyUI-KJNodes)) | 0.999 | 1.14x |
+| | [SGLDiffusion](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion) | 0.920 | 1.24x |
+| | **Qlip BF16 + LoRA** | 0.957 | 1.19x |
+| | **Qlip FP8 + LoRA** | 0.773 | 1.48x |
+| | **Qlip FP8 + Cache** | 0.565 | **2.02x** |
 
 ### Video Generation (LTX-Video 2, 1280x720, 121 frames, 8 basic sampler steps + 3 upsampling steps)
 
@@ -663,6 +684,7 @@ Precompiled engines are hosted on HuggingFace. The **Qlip Engines Loader** node 
 | Z-Image-Turbo BF16 + LoRA | `TheStageAI/Elastic-Z-Image-Turbo:models/H100/z-image-turbo_lora` |
 | Z-Image-Turbo FP8 + LoRA | `TheStageAI/Elastic-Z-Image-Turbo:models/H100/z-image-turbo-fp8_lora` |
 | LTX-Video 2.3 22B Distilled FP8 + LoRA (t2v) | `TheStageAI/Elastic-LTX-2.3:models/H100/ltx-2.3-22b-distilled-fp8_lora` |
+| LTX-Video 2.3 22B Dev FP8-static (t2v, no LoRA, 1280×704×121) | `TheStageAI/Elastic-LTX-2.3:models/H100/ltx-2.3-22b-dev-fp8-static` |
 | Qwen Image Edit BF16 + LoRA | `TheStageAI/Elastic-Qwen-Image-Edit:models/H100/qwen-image-edit-bf16_lora` |
 | Wan 2.2 I2V High-Noise FP8 + LoRA | `TheStageAI/Elastic-Wan2.2-I2V:models/H100/wan-i2v-high-noise-fp8_lora` |
 | Wan 2.2 I2V Low-Noise FP8 + LoRA | `TheStageAI/Elastic-Wan2.2-I2V:models/H100/wan-i2v-low-noise-fp8_lora` |
@@ -792,6 +814,132 @@ Enables or disables LoRA at runtime without reloading engines. Use after `Qlip E
 | `lora_stack` | QLIP_LORA_STACK | No | | LoRA stack to load (when enabling) |
 
 **Output:** `MODEL`
+
+### Qlip Auto Sparse
+
+One-knob block-sparse attention on any DiT (image or video). Swaps ComfyUI's
+`optimized_attention` for a router: long self-attention calls go to qlip's
+int8 dynamic block-sparse kernel, everything else (text/cross attention,
+masked calls, short sequences) passes to the original kernel untouched.
+Blocks are picked dynamically every step — no per-model tuning, no fixed
+pattern baked in. Works on eager models and compiled engines alike; toggle
+`enable` off to restore stock attention with no reload. Runs through the
+licensed qlip session (same login as the engines).
+
+| Input | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `model` | MODEL | Yes | | Any DiT (LTX, Wan, etc.) |
+| `enable` | BOOLEAN | Yes | `True` | Enable sparse attention |
+| `sparsity` | FLOAT | Yes | `0.5` | Fraction of attention blocks to DROP. 0.5 is safe, 0.7 is the validated fast point with the diversity selector, 0.9 is a draft mode |
+| `selector` | CHOICE | No | `diversity` | How blocks are picked. `diversity` (recommended) = similarity minus redundancy — best quality at equal speed. `topk` = flat top-k by similarity. `meansim` = cdf mass + self-similarity |
+| `simthreshd1` | FLOAT | No | `0.1` | `meansim` only: self-similarity threshold; higher = more sparsity |
+| `smooth_k` | BOOLEAN | No | `True` | Key smoothing (de-mean) — usually improves quality at no cost |
+
+**Output:** `MODEL`
+
+### Qlip Cache
+
+Step caching — skip whole denoising steps by predicting the model's output when
+the trajectory moves slowly. Wraps the UNet call through ComfyUI's official
+wrapper hook, so it runs over any engine (FP8 / NVFP4) and eager models,
+with a **separate cache per CFG branch** (cond/uncond never share a predictor).
+Step mode is best on many-step schedules (base models, 20–50 steps); `block`
+mode (DBCache-style: first/last blocks always compute, middle blocks skipped
+via a cached residual) also helps few-step distilled models.
+
+| Input | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `model` | MODEL | Yes | | Diffusion model |
+| `enable` | BOOLEAN | Yes | `True` | Enable caching |
+| `threshold` | FLOAT | Yes | `0.15` | step mode: accumulated-error budget before a forced recompute. block mode: rel-L1 hidden-state diff below which middle blocks are skipped (0.05–0.1 typical). Higher = more skips = faster, riskier |
+| `mode` | CHOICE | Yes | `step` | `step` = skip whole denoising steps. `block` = skip the middle transformer blocks per step |
+| `method` | CHOICE | No | `hermite` | `easycache` (reuse last output), `taylor` (TaylorSeer extrapolation), `hermite` (HiCache — damped extrapolation, steadiest) |
+| `order` | INT | No | `2` | Extrapolation order for taylor/hermite (caches `order` history tensors) |
+| `warmup_steps` | INT | No | `4` | First steps always computed — they set composition; never cache them |
+| `max_consecutive_skips` | INT | No | `3` | Hard cap on skips in a row so error can't compound |
+| `fn_blocks` | INT | No | `8` | block mode: first N blocks that always compute (their output is the skip probe) |
+| `bn_blocks` | INT | No | `0` | block mode: last N blocks that always compute (refinement tail) |
+
+**Output:** `MODEL`
+
+### Qlip Cache Report
+
+Prints how many steps were real vs skipped and the resulting compute ratio /
+ideal speedup. Connect `trigger` to a post-sampler output so it runs after
+generation. No model input needed.
+
+| Input | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `trigger` | * | No | | Connect any post-sampler output to order execution |
+
+**Output:** `STRING` (also printed to console).
+
+### Qlip Progressive
+
+Progressive resolution — early denoising steps run on a **downscaled latent**,
+then the trajectory continues at full resolution. Composition forms early and
+survives the upscale; the saved compute scales with resolution (the higher the
+target, the more it pays). Implemented as a model hook over ComfyUI's official
+wrapper — keep your own sampler. The noisy latent is downscaled with nearest
+sampling (noise statistics preserved), clean conditioning bilinearly, and
+nested multimodal latents are handled natively (e.g. MiniMax H3: video is
+downscaled, audio passes through untouched).
+
+| Input | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `model` | MODEL | Yes | | Any DiT; this is a model hook, not a sampler |
+| `enable` | BOOLEAN | Yes | `True` | Enable progressive resolution |
+| `low_scale` | FLOAT | Yes | `0.5` | sigma mode only: latent side scale for the low-res phase |
+| `switch_at` | FLOAT | Yes | `0.5` | sigma mode only: fraction of the sigma range spent at low resolution |
+| `switch_mode` | CHOICE | No | `auto` | `auto` = adaptive ladder, no knobs (starts at 0.25 and climbs by itself). `sigma` = fixed single switch at `switch_at` with `low_scale` |
+| `stab_threshold` | FLOAT | No | `0.08` | Reserved; auto mode ignores this |
+
+**Output:** `MODEL`
+
+### Qlip Compile
+
+Managed compilation of the diffusion model — no ONNX export, no engine build.
+Discovers the transformer block stacks, compiles each block class once through
+`torch.compile`, memoizes shape-pure glue (RoPE embedders) and can put every
+large block Linear on the FP8/FP4 path via native scaled GEMM. Vs whole-model
+`torch.compile`: same steady-state speed, but cold start is seconds instead of
+minutes and **resolution changes need no recompile**. Install is lazy — it
+happens on the first model call, so LoRA patches and device placement are
+already settled; a block that fails to compile permanently falls back to eager
+and the run never breaks.
+
+Compose order: `QlipAutoSparse → QlipCompile → QlipCache → QlipProgressive`.
+
+| Input | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `model` | MODEL | Yes | | Any DiT; composes with the other Qlip nodes |
+| `enable` | BOOLEAN | Yes | `True` | Enable compilation |
+| `quantize` | CHOICE | Yes | `none` | `fp8` = e4m3 scaled GEMM (H100+). `fp4` = nvfp4, Blackwell sm_100+ only (falls back to fp8 elsewhere) |
+| `backend` | CHOICE | No | `default` | `torch.compile` mode for the blocks; `max-autotune` compiles much longer for ~1% extra |
+| `act_scales` | CHOICE | No | `calibrate-first-run` | fp8 only. First run records amax, then scales freeze static (fastest). `dynamic` = per-call amax forever (~6% slower, no warmup) |
+| `force_resident` | BOOLEAN | No | `True` | Convert weight-streamed (dynamic-VRAM) models to fully resident before compiling — compiled steps must not be PCIe-bound |
+| `weights_policy` | CHOICE | No | `keep` | `release`: after fp8/fp4 quantization free the master weights — big VRAM win, irreversible until checkpoint reload; apply LoRAs first |
+| `quant_config` | QLIP_QUANT | No | | Optional Qlip Quant Config node — overrides `quantize`/`act_scales` |
+
+**Output:** `MODEL`
+
+### Qlip Quant Config
+
+Full quantization control for Qlip Compile (optional — the `quantize` input
+covers the common cases).
+
+| Input | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `scheme` | CHOICE | Yes | `fp8_e4m3` | `fp8_e4m3` (H100+) or `nvfp4` (e2m1 + per-16 e4m3 block scales, Blackwell) |
+| `weight_granularity` | CHOICE | Yes | `per-tensor` | `per-channel` = rowwise scaled GEMM: more accurate, slightly slower, no calibration needed |
+| `act_scales` | CHOICE | Yes | `calibrate` | per-tensor only: `calibrate` (freeze static after `calib_runs`) or `dynamic` (per-call amax) |
+| `calib_runs` | INT | Yes | `1` | Sampling runs that feed the observer before scales freeze |
+| `observer` | CHOICE | Yes | `max` | `max` = running maximum (safe), `ema` = exponential moving average (ignores rare spikes) |
+| `ema_decay` | FLOAT | Yes | `0.8` | EMA observer decay |
+| `min_dim` | INT | Yes | `512` | Linears with any side smaller than this stay unquantized |
+| `skip_layers` | STRING | Yes | `""` | Comma-separated name substrings kept in high precision, e.g. `qkv` |
+
+**Output:** `QLIP_QUANT`
 
 ### Qlip Timer Start
 

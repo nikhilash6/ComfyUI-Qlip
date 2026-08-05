@@ -753,3 +753,21 @@ def patch_zimage_fixed_cap_len(transformer, fixed_cap_len: int = 64):
     transformer.embed_cap = patched_embed_cap
     print(f"[qlip] Patched embed_cap: cap_feats forced to "
           f"{fixed_cap_len} tokens")
+
+
+def _rebind_optimized_attention(orig_fn, new_fn):
+    """Set `optimized_attention = new_fn` in the source module and in every
+    loaded module that imported the original by value. Returns the list of
+    modules patched so the caller's uninstall can restore them."""
+    import sys
+    patched = []
+    for name, mod in list(sys.modules.items()):
+        if mod is None:
+            continue
+        if getattr(mod, "optimized_attention", None) is orig_fn:
+            try:
+                mod.optimized_attention = new_fn
+                patched.append(mod)
+            except Exception:
+                pass
+    return patched

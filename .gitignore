@@ -1,2 +1,5 @@
 docs
 .claude
+backup
+venv
+bench
